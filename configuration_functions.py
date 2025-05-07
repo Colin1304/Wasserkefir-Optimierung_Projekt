@@ -1,62 +1,76 @@
-import os  # Dateisystem-Zugriff
-import pandas as pd  # DataFrame-Verarbeitung
-from ax.service.ax_client import ObjectiveProperties  # für Objective-Definitionen
+import os
+import pandas as pd
+from ax.service.ax_client import ObjectiveProperties
 
-CONFIG_PATH = "config.xlsx"  # Pfad zur Config-Excel
-EXPERIMENT_DATA_PATH = "experiment_data.xlsx"  # Pfad zur Experiment-Daten-Excel
+CONFIG_PATH = "config.xlsx"
+EXPERIMENT_DATA_PATH = "experiment_data.xlsx"
 
-## load_column_type_order - geht auch einfacher (nur Zeile 20)
 def load_column_type_order():
     """
-    Lädt aus dem Sheet 'ColumnTypeOrder' die gewünschte Reihenfolge der Spaltentypen.
+    Lädt die Spaltentyp-Reihenfolge aus dem Sheet 'ColumnTypeOrder'.
     """
-    config = pd.read_excel(CONFIG_PATH, sheet_name=None)  # Config-Datei lesen
+    config = pd.read_excel(CONFIG_PATH, sheet_name=None)
     cols = (
-        config.get("ColumnTypeOrder", pd.DataFrame(columns=["Spaltentyp"]))["Spaltentyp"]  # Spaltentypen-Liste
-        .dropna()  # leere Einträge entfernen
-        .tolist()  # als Liste zurückgeben
+        config
+        .get("ColumnTypeOrder", pd.DataFrame(columns=["Spaltentyp"]))
+        ["Spaltentyp"]
+        .dropna()
+        .tolist()
     )
-    if not cols:  # wenn keine Einträge
-        cols = ["trial_index", "feste_parameter", "parameters", "objectives", "info"]  # Default-Reihenfolge
-    return cols  # Reihenfolge zurückgeben
+    if not cols:
+        cols = ["trial_index", "feste_parameter", "parameters", "objectives", "info"]
+    return cols
 
-## load_parameter_and_objective_config
 def load_parameter_and_objective_config():
     """
-    Liest aus dem Config-Excel:
-      - parameters (+ bounds, digits)
-      - objectives (mit minimize-Flag)
-      - parameter_constraints (als Strings)
+    Liest Parameter-/Objective-Config aus Excel.
     """
-    config = pd.read_excel(CONFIG_PATH, sheet_name=None)  # gesamte Config-Datei
-
-    params_df = config.get("parameters", pd.DataFrame())  # Parameter-Sheet
-    if {"min_bound", "max_bound"}.issubset(params_df.columns):  # wenn Bounds definiert
+    config = pd.read_excel(CONFIG_PATH, sheet_name=None)
+    # Parameter
+    params_df = config.get("parameters", pd.DataFrame())
+    if {"min_bound", "max_bound"}.issubset(params_df.columns):
         params_df["bounds"] = params_df.apply(
-            lambda r: [float(r["min_bound"]), float(r["max_bound"])], axis=1
-        )  # bounds-Liste erzeugen
-        params_df = params_df.drop(columns=["min_bound", "max_bound"])  # Spalten entfernen
-    if "digits" in params_df.columns:  # falls Rundungsstellen definiert
-        params_df["digits"] = params_df["digits"].astype("Int64")  # in Int64 umwandeln
+            lambda r: [float(r["min_bound"]), float(r["max_bound"])],
+            axis=1,
+        )
+        params_df = params_df.drop(columns=["min_bound", "max_bound"])
+    if "digits" in params_df.columns:
+        params_df["digits"] = params_df["digits"].astype("Int64")
     else:
-        params_df["digits"] = None  # sonst None
-    params_df["value_type"] = params_df["digits"].apply(lambda d: "int" if d == 0 else "float")  # Typ bestimmen
-    parameters = params_df.to_dict("records")  # als Liste von Dicts
+        params_df["digits"] = None
+    params_df["value_type"] = params_df["digits"].apply(
+        lambda d: "int" if d == 0 else "float"
+    )
+    parameters = params_df.to_dict("records")
 
-    objs_df = config.get("objectives", pd.DataFrame(columns=["name", "minimize"]))  # Objectives-Sheet
-    objectives = {r["name"]: ObjectiveProperties(minimize=bool(r["minimize"])) for _, r in objs_df.iterrows()}  # Dict erzeugen
+    # Objectives
+    objs_df = config.get("objectives", pd.DataFrame(columns=["name", "minimize"]))
+    objectives = {
+        r["name"]: ObjectiveProperties(minimize=bool(r["minimize"]))
+        for _, r in objs_df.iterrows()
+    }
 
-    constraint_df = config.get("parameter_constraints", pd.DataFrame())  # Constraints-Sheet
-    parameter_constraints = constraint_df.get("constraint", pd.Series()).dropna().tolist()  # als Liste
+    # Parameter-Constraints
+    constraint_df = config.get("parameter_constraints", pd.DataFrame())
+    parameter_constraints = (
+        constraint_df.get("constraint", pd.Series())
+        .dropna()
+        .tolist()
+    )
 
-    return parameters, objectives, parameter_constraints  # zurückgeben
+    return parameters, objectives, parameter_constraints
 
-## load_feste_parameter_columns
 def load_feste_parameter_columns():
     """
-    Liest aus dem Sheet 'Feste_Parameter' die Namen fester Parameter-Spalten.
+    Liest feste Parameter-Spalten aus Excel.
     """
-    if os.path.exists(CONFIG_PATH):  # wenn Config-Datei existiert
-        conf = pd.read_excel(CONFIG_PATH, sheet_name=None)  # einlesen
-        return conf.get("Feste_Parameter", pd.DataFrame(columns=["name"]))["name"].dropna().tolist()  # Liste zurückgeben
-    return []  # sonst leere Liste
+    if os.path.exists(CONFIG_PATH):
+        conf = pd.read_excel(CONFIG_PATH, sheet_name=None)
+        return (
+            conf
+            .get("Feste_Parameter", pd.DataFrame(columns=["name"]))
+            ["name"]
+            .dropna()
+            .tolist()
+        )
+    return []

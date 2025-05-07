@@ -1,33 +1,52 @@
-import os  # für Dateipfade und Existenzprüfungen
-import pandas as pd  # DataFrame-Verarbeitung
-from configuration_functions import (load_parameter_and_objective_config, load_feste_parameter_columns, load_column_type_order, CONFIG_PATH, EXPERIMENT_DATA_PATH)  # Config-Pfade und Funktionen
+import os
+import pandas as pd
+from configuration_functions import (
+    load_parameter_and_objective_config,
+    load_feste_parameter_columns,
+    load_column_type_order,
+    CONFIG_PATH,
+    EXPERIMENT_DATA_PATH,
+)
 
-def load_existing_data():  # Hauptfunktion zum Laden der Daten
-    parameters, objectives, _ = load_parameter_and_objective_config()  # lade Param-/Objective-Config
+def load_existing_data():
+    """
+    Lädt vorhandene Experimentdaten, stellt sicher,
+    dass alle benötigten Spalten existieren und sortiert sie.
+    """
+    parameters, objectives, _ = load_parameter_and_objective_config()
 
-    config = pd.read_excel(CONFIG_PATH, sheet_name=None)  # gesamte Config-Datei einlesen
-    info_cols = (  # Spalten unter „Informationspalten“
-        config.get("Informationspalten", pd.DataFrame()).get("name", pd.Series()).dropna().tolist()
+    config = pd.read_excel(CONFIG_PATH, sheet_name=None)
+    info_cols = (
+        config
+        .get("Informationspalten", pd.DataFrame())
+        .get("name", pd.Series())
+        .dropna()
+        .tolist()
     )
-    feste_param_cols = load_feste_parameter_columns()  # feste Parameter-Spalten einlesen
+    feste_param_cols = load_feste_parameter_columns()
 
-    required_columns = (  # alle notwendigen Spalten
-        [p["name"] for p in parameters] + list(objectives.keys()) + ["trial_index"] + info_cols + feste_param_cols
+    required_columns = (
+        [p["name"] for p in parameters]
+        + list(objectives.keys())
+        + ["trial_index"]
+        + info_cols
+        + feste_param_cols
     )
 
-    if os.path.exists(EXPERIMENT_DATA_PATH):  # falls Datei existiert
-        df = pd.read_excel(EXPERIMENT_DATA_PATH)  # lade Excel-Datei
+    if os.path.exists(EXPERIMENT_DATA_PATH):
+        df = pd.read_excel(EXPERIMENT_DATA_PATH)
     else:
-        df = pd.DataFrame(columns=required_columns)  # sonst leeres DataFrame mit Spalten
+        df = pd.DataFrame(columns=required_columns)
 
-    for col in required_columns:  # jede erforderliche Spalte prüfen
-        if col not in df.columns:  
-            df[col] = pd.NA  # fehlende Spalte als NA anlegen
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = pd.NA
 
-    type_order = load_column_type_order()  # gewünscht Reihenfolge der Spaltentypen
-    param_names = [p["name"] for p in parameters]  # Parameternamen-Liste
+    # Spalten nach Typen sortieren
+    type_order = load_column_type_order()
+    param_names = [p["name"] for p in parameters]
     type_by_col = {}
-    for col in df.columns:  # jeden DataFrame-Spaltennamen klassifizieren
+    for col in df.columns:
         if col == "trial_index":
             tp = "trial_index"
         elif col in feste_param_cols:
@@ -43,11 +62,11 @@ def load_existing_data():  # Hauptfunktion zum Laden der Daten
         type_by_col[col] = tp
 
     ordered = []
-    for t in type_order:  # für jeden Typ in der Reihenfolge
-        cols = sorted([c for c, tp in type_by_col.items() if tp == t])  # sortierte Liste
-        ordered.extend(cols)  # anhängen
-    rest = sorted([c for c in df.columns if type_by_col.get(c) not in type_order])  # übrige Spalten
-    ordered.extend(rest)  # anhängen
+    for t in type_order:
+        cols = sorted([c for c, tp in type_by_col.items() if tp == t])
+        ordered.extend(cols)
+    rest = sorted([c for c in df.columns if type_by_col.get(c) not in type_order])
+    ordered.extend(rest)
 
-    df = df[ordered]  # Spalten neu anordnen
-    return df, info_cols, feste_param_cols  # Rückgabe: DataFrame und Metalisten
+    df = df[ordered]
+    return df, info_cols, feste_param_cols

@@ -1,127 +1,236 @@
-import warnings  # für Warnungssteuerung
-warnings.filterwarnings("ignore", category=FutureWarning)  # Future-Warnings unterdrücken
-warnings.filterwarnings("ignore", category=UserWarning, message="Encountered exception in computing model fit quality") #kein Vorhersage‑API implementiert, und daher schlägt dieser Evaluations‑Schritt fehl.
-import logging 
-logging.getLogger("ax").setLevel(logging.WARNING) # Alle INFO‑Meldungen von Ax komplett ausblenden - zum Debuggen auskommentieren
-import math  # für Abrund-Operationen
-import pandas as pd  # DataFrame-Verarbeitung
-from ax.exceptions.core import DataRequiredError  # Fehler falls Daten fehlen
-from ax.service.ax_client import AxClient  # Hauptklasse für Ax
-from ax.modelbridge.generation_strategy import GenerationStrategy, GenerationStep  # Strategiedefinition
-from ax.modelbridge.registry import Models  # registrierte Modelle
-from configuration_functions import load_parameter_and_objective_config  # Config-Funktion
-from save_data import save_data  # speichert DataFrame in Excel
+import os
+import math
+import pandas as pd
+from ax.exceptions.core import DataRequiredError
+from ax.service.ax_client import AxClient
+from ax.modelbridge.generation_strategy import GenerationStrategy, GenerationStep
+from ax.modelbridge.registry import Models
+from configuration_functions import load_parameter_and_objective_config
+from save_data import save_data
 
-## create_ax_client (verwendet in ensure client)
-def create_ax_client(sobol_seed=None, sobol_trials=0):
-    parameters, objectives, parameter_constraints = load_parameter_and_objective_config()  # Config laden
-    steps = []  # Liste der Generationsschritte
-    if sobol_trials > 0:  # wenn Sobol-Anteil
-        steps.append(GenerationStep(model=Models.SOBOL, num_trials=sobol_trials, model_kwargs={"seed": sobol_seed}))  # Sobol-Step
-    steps.append(GenerationStep(model=Models.BOTORCH_MODULAR, num_trials=-1))  # BoTorch-Folge
-    strat = GenerationStrategy(steps=steps)  # Strategie zusammenstellen
+# Pfad zur Persistenz des AxClients
+CLIENT_JSON_PATH = "ax_client.json"
 
-    client = AxClient(generation_strategy=strat, verbose_logging=False)  # AxClient erzeugen
-    client.create_experiment(name="async_experiment", parameters=parameters, objectives=objectives, parameter_constraints=parameter_constraints)  # Experiment erstellen
-    return client  # Client zurückgeben
 
-## add_trials_to_ax
-def add_trials_to_ax(client: AxClient, df: pd.DataFrame):
-    parameters, objectives, _ = load_parameter_and_objective_config()  # Config laden
-    pnames = [p["name"] for p in parameters]  # Parameternamen-Liste
-    for _, row in df.iterrows():  # jede DataFrame-Zeile
-        raw = {k: float(row[k]) for k in pnames if pd.notna(row[k])}  # vorhandene Parameterwerte
-        if len(raw) != len(pnames):  # wenn unvollständig
-            continue  # überspringen
-        floored = {k: math.floor(v * 10) / 10 for k, v in raw.items()}  # abrunden auf 1 Dezim.
-        _, trial_index = client.attach_trial(parameters=floored)  # Arm anlegen - Versuchssetup
-        results = {o: float(row[o]) for o in objectives if pd.notna(row[o])}  # vorhandene Objectives - baut ein Python‑Dictionary namens results, in dem für jedes Objective (o) ein Eintrag angelegt wird, falls in der aktuellen DataFrame‑Zeile (row) für genau dieses Objective kein NaN (also ein gültiger Messwert) steht
-        if results:  # falls Ergebnisse vorliegen
-            client.complete_trial(trial_index=trial_index, raw_data=results)  # Trial abschließen
+def save_client(client: AxClient):
+    """
+    Speichert den aktuellen AxClient-Zustand in eine JSON-Datei.
+    """
+    client.save_to_json_file(CLIENT_JSON_PATH)
 
-## ensure_client
+
+def load_client() -> AxClient:
+    """
+    Lädt den AxClient aus der JSON-Datei.
+    """
+    return AxClient.load_from_json_file(CLIENT_JSON_PATH)
+
+
+def create_ax_client(sobol_seed=None, sobol_trials=0) -> AxClient:
+    """
+    Erzeugt einen neuen AxClient mit:
+      - Sobol für `sobol_trials` Trials (falls >0),
+      - anschließend unendlich BoTorch.
+    """
+    parameters, objectives, parameter_constraints = load_parameter_and_objective_config()
+    steps = []
+    if sobol_trials and sobol_trials > 0:
+        steps.append(
+            GenerationStep(
+                model=Models.SOBOL,
+                num_trials=sobol_trials,
+                model_kwargs={"seed": sobol_seed},
+            )
+        )
+    steps.append(GenerationStep(model=Models.BOTORCH_MODULAR, num_trials=-1))
+    strat = GenerationStrategy(steps=steps)
+
+    client = AxClient(
+        generation_strategy=strat,
+        verbose_logging=False,
+        random_seed=sobol_seed,
+    )
+    client.create_experiment(
+        name="async_experiment",
+        parameters=parameters,
+        objectives=objectives,
+        parameter_constraints=parameter_constraints,
+    )
+    return client
+
+
+def add_trials_to_ax(client: AxClient, df: pd.DataFrame) -> None:
+    """
+    Hängt alle Trials aus `df` (Parameter + Outputs) an den geladenen AxClient.
+    Nur solche Zeilen, die bereits Outputs (Objective-Werte) haben, werden komplett angehängt.
+    """
+    parameters, objectives, _ = load_parameter_and_objective_config()
+    pnames = [p["name"] for p in parameters]
+    obj_names = [o.name if hasattr(o, "name") else o for o in objectives]
+
+    # Temporär Parameter-Constraints ausschalten
+    space = client.experiment.search_space
+    old_constraints = space._parameter_constraints
+    space._parameter_constraints = []
+
+    for _, row in df.iterrows():
+        # Nur Zeilen mit vollständigen Parametern
+        if any(pd.isna(row[p]) for p in pnames):
+            continue
+        params = {p: float(row[p]) for p in pnames}
+        # Floorden auf 0.1-Stufen
+        params = {k: math.floor(v * 10) / 10 for k, v in params.items()}
+        # Attach Trial
+        trial, trial_index = client.attach_trial(parameters=params)
+        # Wenn Outputs vorhanden, complete_trial
+        if not any(pd.isna(row[obj]) for obj in obj_names):
+            data = {obj: float(row[obj]) for obj in obj_names}
+            client.complete_trial(trial_index=trial_index, raw_data=data)
+
+    # Constraints wiederherstellen
+    space._parameter_constraints = old_constraints
+
+
 def ensure_client(client, df, sobol_args=None):
     """
-    Stellt sicher, dass ein AxClient existiert und lädt lokale Trials hoch.
+    1) Wenn `client` schon im Speicher, return.
+    2) Wenn `sobol_args=(seed,cnt)` gegeben (erstes Trial):
+       - neuen Client mit Sobol(cnt)+BoTorch erzeugen und speichern.
+    3) Sonst, wenn JSON existiert (Folgeaufrufe):
+       - Client laden,
+       - alle im df bereits eingetragenen Trials (inkl. Outputs) anhängen,
+       - Strategy auf BoTorch-only setzen,
+       - return.
+    4) Sonst (erstmaliger Start ohne Sobol-Args):
+       - reinen BoTorch-Client erzeugen,
+       - vorhandene df-Trials anhängen,
+       - speichern und return.
     """
-    if client is None:  # falls noch kein Client
-        if sobol_args:  
-            client = create_ax_client(*sobol_args)  # mit Sobol-Init.
-        else:
-            client = create_ax_client()  # ohne Sobol
-        add_trials_to_ax(client, df)  # Trials nach Ax hochladen
-    return client  # bestehenden oder neuen Client zurückgeben
+    if client is not None:
+        return client
 
-## prompt_float
+    #  Erstes Trial: Sobol-Phase
+    if sobol_args is not None:
+        seed, cnt = sobol_args
+        client = create_ax_client(sobol_seed=seed, sobol_trials=cnt)
+        save_client(client)
+        return client
+
+    #  Folgeaufrufe: JSON laden, df-Trials anhängen, BoTorch-only setzen
+    if os.path.exists(CLIENT_JSON_PATH):
+        client = load_client()
+        # Alte Trials + Outputs anhängen
+        add_trials_to_ax(client, df)
+        # Strategy auf BoTorch-only wechseln
+        botorch_only = GenerationStrategy(
+            steps=[GenerationStep(model=Models.BOTORCH_MODULAR, num_trials=-1)]
+        )
+        client._generation_strategy = botorch_only
+        return client
+
+    #  Erststart ohne Sobol-Args: BoTorch-Client + df-Trials
+    client = create_ax_client()
+    add_trials_to_ax(client, df)
+    save_client(client)
+    return client
+
+
 def prompt_float(prompt_text):
-    """Fordert eine Fließkommazahl vom Nutzer an und validiert sie."""
-    while True:  # Schleife bis gültige Eingabe
-        val = input(prompt_text).strip()  # Eingabe abholen
+    """
+    Liest von der CLI eine gültige Fließzahl ein.
+    """
+    while True:
+        val = input(prompt_text).strip()
         try:
-            return float(val)  # in float umwandeln und zurückgeben
+            return float(val)
         except ValueError:
-            print("Ungültig, bitte Fließzahl eingeben.")  # Fehlermeldung
+            print("Ungültig, bitte Fließzahl eingeben.")
 
-## add_outputs_flow
-def add_outputs_flow(df, client, prompt_fn, load_param_cfg):
-    """
-    Fragt alle fehlenden Objective-Werte ab, speichert lokal und schließt Trials in Ax ab.
-    """
-    parameters, objectives, _ = load_param_cfg()  # Config laden
-    obj_names = list(objectives.keys())  # Liste der Objective-Namen
-    missing_idx = df[df[obj_names].isnull().any(axis=1)].index.tolist()  # Indizes mit fehlenden Outputs
-    for count, idx in enumerate(missing_idx, start=1):  # jeden fehlenden Trial
-        trial_idx = int(df.at[idx, "trial_index"])  # Trial-Index holen
-        print(f"\nTrial {count}/{len(missing_idx)} – Trial Index: {trial_idx}")  # Statusanzeige
-        outputs = {}  # Ergebnisse sammeln
-        for obj in obj_names:  # jedes Objective
-            if pd.isna(df.at[idx, obj]):  # falls Wert fehlt
-                val = prompt_fn(f"Wert für {obj}: ")  # abfragen
-                df.at[idx, obj] = val  # DataFrame aktualisieren
-                outputs[obj] = val  # sammeln
-        save_data(df)  # lokal speichern
-        client.complete_trial(trial_index=trial_idx, raw_data=outputs)  # Trial abschließen
-    print("\nAlle Outputs eingetragen.")  # Abschlussmeldung
-    return df  # aktualisiertes DataFrame zurückgeben
 
-## append_trial
-def append_trial(df, trial, idx):
+def add_outputs_flow(df: pd.DataFrame, client: AxClient, prompt_fn, load_param_cfg):
     """
-    Baut aus neuen Trial-Parametern + Index eine Zeile und hängt sie ans DataFrame.
+    Fragt fehlende Objective-Werte ab, schließt Trials ab und speichert.
     """
-    row = {**trial, "trial_index": idx}  # Parameter und Index kombinieren
-    df2 = pd.concat([df, pd.DataFrame([row])], ignore_index=True)  # Zeile anhängen
-    return df2[df.columns]  # mit originaler Spaltenreihenfolge zurückgeben
+    parameters, objectives, _ = load_param_cfg()
+    obj_names = [o.name if hasattr(o, "name") else o for o in objectives]
+    missing_idx = df[df[obj_names].isnull().any(axis=1)].index.tolist()
 
-## generate_new_trial
-def generate_new_trial(client, df):
+    for count, idx in enumerate(missing_idx, start=1):
+        trial_idx = int(df.at[idx, "trial_index"])
+        print(f"\nTrial {count}/{len(missing_idx)} – Trial Index: {trial_idx}")
+        outputs = {}
+        for obj in obj_names:
+            if pd.isna(df.at[idx, obj]):
+                val = prompt_fn(f"Wert für {obj}: ")
+                df.at[idx, obj] = val
+                outputs[obj] = val
+        save_data(df)
+        client.complete_trial(trial_index=trial_idx, raw_data=outputs)
+
+    print("\nAlle Outputs eingetragen.")
+    save_client(client)
+    return df
+
+
+def append_trial(df, params: dict, trial_index: int):
     """
-    Generiert einen neuen Trial via AxClient und gibt (params, neues_df) zurück.
+    Hängt eine neue Zeile mit Parametern + trial_index an `df` an.
+    """
+    floored = {}
+    for k, v in params.items():
+        try:
+            fv = float(v)
+            floored[k] = math.floor(fv * 10) / 10
+        except (ValueError, TypeError):
+            floored[k] = v
+    new_row = {**floored, "trial_index": trial_index}
+    df2 = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    return df2[df.columns]
+
+
+def generate_new_trial(client: AxClient, df: pd.DataFrame):
+    """
+    Generiert einen einzelnen neuen Trial via BoTorch, hängt ihn an df und speichert.
     """
     try:
-        result = client.get_next_trials(1)  # fordere 1 Trial an
-        trials = result[0] if isinstance(result, tuple) else result  # entpacke evtl. Tuple - 0 ist der Index des ersten Elements
+        result = client.get_next_trials(1)
     except DataRequiredError:
-        print("Fehler: Keine abgeschlossenen Trials vorhanden.")  # Fehler, falls notwendig
-        return None, df  # unverändert zurückgeben
-    idx, params = next(iter(trials.items()))  #Extrahiere das erste trial_index/Parameter-Dict-Paar aus dem trials-Dictionary
-    df2 = append_trial(df, params, idx)  # neuen Trial anhängen
-    save_data(df2)  # speichern
-    return params, df2  # Parameter und neues DataFrame zurückgeben
+        print("Fehler: Keine abgeschlossenen Trials mit Outputs vorhanden. "
+              "Bitte zuerst Option 3 ('Add Outputs') ausführen.")
+        return None, df
 
-## generate_batch_trials
-def generate_batch_trials(client, df, cnt):
+    trials = result[0] if isinstance(result, tuple) else result
+    idx, params = next(iter(trials.items()))
+    df2 = append_trial(df, params, idx)
+    save_data(df2)
+    save_client(client)
+    return params, df2
+
+
+def generate_batch_trials(client: AxClient, df: pd.DataFrame, cnt: int):
     """
-    Generiert mehrere (cnt) neue Trials und hängt sie ans DataFrame.
+    Generiert `cnt` Arms per Batch:
+      - Beim ersten Aufruf (Sobol-Phase) Sobol für `cnt` Trials.
+      - Danach (BoTorch-only) BoTorch für je `cnt` Trials.
+      - Fängt DataRequiredError ab, falls trotzdem keine Daten vorhanden.
     """
-    df2 = df.copy()  # Erstelle eine Kopie des DataFrames, um Änderungen daran vorzunehmen, ohne das Original zu verändern
     try:
-        result = client.get_next_trials(cnt)  # fordere cnt Trials /cnt=count variable aus abfrage bo_process.py
-        trials = result[0] if isinstance(result, tuple) else result #wenn tuple
+        gen_run = client.generation_strategy.gen(
+            experiment=client.experiment,
+            n=cnt,
+        )
     except DataRequiredError:
-        print("Fehler: Keine abgeschlossenen Trials vorhanden.")  # Fehler
-        return df2  # unverändert zurückgeben
-    for idx, params in trials.items():  # jeden neuen Trial
-        df2 = append_trial(df2, params, idx)  # anhängen
-    save_data(df2)  # speichern
-    return df2  # erweitertes DataFrame zurückgeben
+        print("Fehler: Keine abgeschlossenen Trials mit Outputs vorhanden. "
+              "Bitte zuerst Option 3 ('Add Outputs') ausführen.")
+        return df
+
+    batch = client.experiment.new_batch_trial(generator_run=gen_run)
+    df2 = df.copy()
+    # Verwende für trial_index den internen Arm-Namen (z.B. '0_0', '0_1', ...)
+    for arm in batch.arms:
+        arm_name = arm.name  # z.B. "0_0", "0_1"
+        df2 = append_trial(df2, arm.parameters, arm_name)
+
+    save_data(df2)
+    save_client(client)
+    return df2
